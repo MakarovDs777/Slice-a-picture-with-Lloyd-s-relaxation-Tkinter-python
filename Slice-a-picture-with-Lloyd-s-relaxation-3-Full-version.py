@@ -10,6 +10,7 @@ import cv2
 THUMB_W, THUMB_H = 140, 100
 DEFAULT_POINTS = 200
 DEFAULT_LLOYD_ITERS = 3
+DEFAULT_BLUR_RADIUS = 6.0  # в пикселях
 
 # ------------------ Вспомогательные функции (Voronoi/Lloyd/отсечение) ------------------
 def subdiv_voronoi_facets(points, rect):
@@ -107,9 +108,8 @@ def lloyd_relaxation(points, rect, iters):
         pts = np.array(new_pts, dtype=np.float64)
     return pts
 
-# ------------------ Построение мозайки (sharp, shuffle) ------------------
+# ------------------ Построение мозайки: sharp / blurred ------------------
 def extract_target_cells(image, facets, rect):
-    """Возвращает список целевых ячеек (bbox, mask_bbox, poly_pts) для данного изображения"""
     h, w, _ = image.shape
     targets = []
     for poly in facets:
@@ -133,8 +133,11 @@ def extract_target_cells(image, facets, rect):
         })
     return targets
 
-def build_shuffled_mosaic_single_source(image, facets, rect):
-    """Патчи берутся из той же картинки (как раньше)."""
+def build_shuffled_mosaic_single_source(image, facets, rect, blur=False, blur_radius=DEFAULT_BLUR_RADIUS):
+    """
+    blur=False -> жёсткая вставка (sharp)
+    blur=True  -> плавная вставка с размытием маски (feather)
+    """
     h, w, _ = image.shape
     targets = extract_target_cells(image, facets, rect)
     n = len(targets)
@@ -147,9 +150,9 @@ def build_shuffled_mosaic_single_source(image, facets, rect):
         patch = image[y0:y1, x0:x1].copy()
         mask_bbox = t["mask_bbox"].copy()
         patches.append({"patch": patch, "mask_bbox": mask_bbox, "bbox": (x0,y0,x1,y1)})
-    # перемешивание
     perm = np.random.permutation(n)
     out = np.zeros_like(image)
+
     for i, tgt in enumerate(targets):
         src = patches[perm[i]]
         tx0, ty0, tx1, ty1 = tgt["bbox"]
@@ -161,19 +164,30 @@ def build_shuffled_mosaic_single_source(image, facets, rect):
         if tgt_mask.shape != (th, tw):
             tgt_mask = cv2.resize(tgt_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
             _, tgt_mask = cv2.threshold(tgt_mask, 127, 255, cv2.THRESH_BINARY)
-        mask_bool = (tgt_mask == 255)
-        dst_region = out[ty0:ty1, tx0:tx1]
-        dst_region[mask_bool] = resized[mask_bool]
-        out[ty0:ty1, tx0:tx1] = dst_region
+
+        if not blur:
+            mask_bool = (tgt_mask == 255)
+            dst_region = out[ty0:ty1, tx0:tx1]
+            dst_region[mask_bool] = resized[mask_bool]
+            out[ty0:ty1, tx0:tx1] = dst_region
+        else:
+            # плавное смешивание по размывающейся маске
+            maskf = (tgt_mask.astype(np.float32) / 255.0)
+            # вычисляем ядро: чем больше blur_radius, тем сильнее размытие
+            kr = max(3, int(round(blur_radius))*2 + 1)
+            # если blur_radius очень мал — оставляем минимальное размытие
+            blurred = cv2.GaussianBlur(maskf, (kr, kr), sigmaX=blur_radius, sigmaY=blur_radius)
+            alpha = np.clip(blurred[..., None], 0.0, 1.0)  # (h, w, 1)
+            dst_region = out[ty0:ty1, tx0:tx1].astype(np.float32)
+            resized_f = resized.astype(np.float32)
+            composed = dst_region * (1.0 - alpha) + resized_f * alpha
+            out[ty0:ty1, tx0:tx1] = np.clip(composed, 0, 255).astype(np.uint8)
+
     zero_mask = np.all(out == 0, axis=2)
     out[zero_mask] = image[zero_mask]
     return out
 
-def build_shuffled_mosaic_cross_source(target_image, facets, rect, source_images):
-    """
-    Для каждой целевой ячейки берём случайный кусок (случайная позиция) из случайного source_image,
-    масштабируем (nearest) в размеры bbox и вставляем по маске целевой ячейки.
-    """
+def build_shuffled_mosaic_cross_source(target_image, facets, rect, source_images, blur=False, blur_radius=DEFAULT_BLUR_RADIUS):
     h, w, _ = target_image.shape
     targets = extract_target_cells(target_image, facets, rect)
     if len(targets) == 0:
@@ -184,14 +198,10 @@ def build_shuffled_mosaic_cross_source(target_image, facets, rect, source_images
         tw = tx1 - tx0; th = ty1 - ty0
         if tw <= 0 or th <= 0:
             continue
-        # выбрать случайный источник
         src_img = random.choice(source_images)
         sh, sw, _ = src_img.shape
-        # выбрать случайный crop в source размером примерно tw x th (если больше размера -> уменьшать)
-        # Чтобы не выходить за границы:
-        crop_w = min(sw, tw)
-        crop_h = min(sh, th)
-        # иногда берем чуть более широкий crop чтобы потом ресайз давал вариативность
+        crop_w = min(sw, max(1, tw))
+        crop_h = min(sh, max(1, th))
         crop_w = max(1, int(random.uniform(0.5, 1.2) * crop_w))
         crop_h = max(1, int(random.uniform(0.5, 1.2) * crop_h))
         crop_w = min(crop_w, sw); crop_h = min(crop_h, sh)
@@ -203,22 +213,34 @@ def build_shuffled_mosaic_cross_source(target_image, facets, rect, source_images
         if tgt_mask.shape != (th, tw):
             tgt_mask = cv2.resize(tgt_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
             _, tgt_mask = cv2.threshold(tgt_mask, 127, 255, cv2.THRESH_BINARY)
-        mask_bool = (tgt_mask == 255)
-        dst_region = out[ty0:ty1, tx0:tx1]
-        dst_region[mask_bool] = resized[mask_bool]
-        out[ty0:ty1, tx0:tx1] = dst_region
+
+        if not blur:
+            mask_bool = (tgt_mask == 255)
+            dst_region = out[ty0:ty1, tx0:tx1]
+            dst_region[mask_bool] = resized[mask_bool]
+            out[ty0:ty1, tx0:tx1] = dst_region
+        else:
+            maskf = (tgt_mask.astype(np.float32) / 255.0)
+            kr = max(3, int(round(blur_radius))*2 + 1)
+            blurred = cv2.GaussianBlur(maskf, (kr, kr), sigmaX=blur_radius, sigmaY=blur_radius)
+            alpha = np.clip(blurred[..., None], 0.0, 1.0)
+            dst_region = out[ty0:ty1, tx0:tx1].astype(np.float32)
+            resized_f = resized.astype(np.float32)
+            composed = dst_region * (1.0 - alpha) + resized_f * alpha
+            out[ty0:ty1, tx0:tx1] = np.clip(composed, 0, 255).astype(np.uint8)
+
     zero_mask = np.all(out == 0, axis=2)
     out[zero_mask] = target_image[zero_mask]
     return out
 
-# ------------------ GUI: галерея + генерация ------------------
+# ------------------ GUI: галерея + генерация (с кнопками Blur / NoBlur) ------------------
 class GalleryApp:
     def __init__(self, master):
         self.master = master
-        master.title("Галерея — Мозаика с перемещёнными фрагментами")
-        self.images = []         # list of dict: {"path", "arr", "thumb_tk", "w","h"}
-        self.selected = set()    # индексы выбранных миниатюр
-        self.result_images = {}  # результаты по индексам (numpy arrays)
+        master.title("Галерея — Мозаика (Sharp / Blur)")
+        self.images = []
+        self.selected = set()
+        self.result_images = {}
 
         # левая панель управления
         ctrl = tk.Frame(master, padx=6, pady=6)
@@ -239,8 +261,18 @@ class GalleryApp:
         tk.Radiobutton(ctrl, text="Separate (свои патчи)", variable=self.mode_var, value="separate").pack(anchor="w")
         tk.Radiobutton(ctrl, text="Cross-source (пулы из выбранных)", variable=self.mode_var, value="cross").pack(anchor="w")
 
-        tk.Button(ctrl, text="Generate", command=self.generate).pack(fill="x", pady=(12,4))
-        tk.Button(ctrl, text="Save All (Desktop)", command=self.save_all).pack(fill="x", pady=3)
+        tk.Label(ctrl, text="Feather blur radius (px):").pack(anchor="w", pady=(10,0))
+        self.blur_scale = tk.Scale(ctrl, from_=0, to=40, orient="horizontal", resolution=1)
+        self.blur_scale.set(int(DEFAULT_BLUR_RADIUS))
+        self.blur_scale.pack(fill="x", pady=2)
+
+        # две кнопки генерации: без и с блюром
+        btn_frame = tk.Frame(ctrl)
+        btn_frame.pack(fill="x", pady=(12,4))
+        tk.Button(btn_frame, text="Generate (No blur)", command=lambda: self.generate(blur=False)).pack(side="left", expand=True, fill="x", padx=2)
+        tk.Button(btn_frame, text="Generate (With blur)", command=lambda: self.generate(blur=True)).pack(side="left", expand=True, fill="x", padx=2)
+
+        tk.Button(ctrl, text="Save All (Desktop)", command=self.save_all).pack(fill="x", pady=6)
 
         # центральная часть: галерея (скроллируемый канвас)
         gallery_frame = tk.Frame(master, bd=2, relief="sunken")
@@ -253,7 +285,7 @@ class GalleryApp:
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.inner_frame = tk.Frame(self.canvas, bg="#f0f0f0")
         self.canvas.create_window((0,0), window=self.inner_frame, anchor="nw")
-        self.thumb_widgets = []  # for drawing borders and binding
+        self.thumb_widgets = []
 
         # правая часть: просмотр выбранного/результата
         preview_frame = tk.Frame(master, bd=2, relief="sunken")
@@ -297,7 +329,6 @@ class GalleryApp:
         self.thumb_widgets.append(frame)
 
     def _refresh_gallery(self):
-        # обновить бордеры по selection
         for i, w in enumerate(self.thumb_widgets):
             if i in self.selected:
                 w.config(bd=3, relief="solid", bg="#cfefff")
@@ -332,7 +363,6 @@ class GalleryApp:
             self.selected.remove(idx)
         else:
             self.selected.add(idx)
-        # показать в preview при одиночном клике
         self.preview_index = idx
         self.show_preview(self.images[idx]["arr"])
         self._refresh_gallery()
@@ -350,7 +380,7 @@ class GalleryApp:
         self.preview_canvas.config(width=self.preview_imgtk.width(), height=self.preview_imgtk.height())
 
     # ---------- Генерация ----------
-    def generate(self):
+    def generate(self, blur=False):
         if not self.selected:
             messagebox.showwarning("Внимание", "Выберите хотя бы одно изображение в галерее.")
             return
@@ -365,7 +395,8 @@ class GalleryApp:
             return
         mode = self.mode_var.get()
         sel_indices = list(self.selected)
-        # подготовка: для каждого выбранного изображения делаем relaxed points и facets
+        blur_radius = float(self.blur_scale.get()) if blur else 0.0
+
         self.result_images = {}
         for idx in sel_indices:
             img = self.images[idx]["arr"]
@@ -378,16 +409,16 @@ class GalleryApp:
             pts_relaxed = lloyd_relaxation(pts, rect, iters)
             facets = subdiv_voronoi_facets(pts_relaxed, rect)
             if mode == "separate":
-                mosaic = build_shuffled_mosaic_single_source(img, facets, rect)
-            else:  # cross-source
-                # соберём пул source_images (numpy arrays) — все выбранные картинки
+                mosaic = build_shuffled_mosaic_single_source(img, facets, rect, blur=blur, blur_radius=blur_radius)
+            else:
                 sources = [self.images[i]["arr"] for i in sel_indices]
-                mosaic = build_shuffled_mosaic_cross_source(img, facets, rect, sources)
+                mosaic = build_shuffled_mosaic_cross_source(img, facets, rect, sources, blur=blur, blur_radius=blur_radius)
             self.result_images[idx] = mosaic
-        # показать первый результат
+
         first = sel_indices[0]
         self.show_preview(self.result_images[first])
-        messagebox.showinfo("Готово", f"Сгенерировано для {len(sel_indices)} изображений. Результат показан для первого выбранного.")
+        st = "With blur" if blur else "No blur"
+        messagebox.showinfo("Готово", f"Сгенерировано ({st}) для {len(sel_indices)} изображений. Результат показан для первого выбранного.")
 
     def save_all(self):
         if not self.result_images:
@@ -396,6 +427,8 @@ class GalleryApp:
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         for idx, arr in self.result_images.items():
             base = os.path.splitext(os.path.basename(self.images[idx]["path"]))[0]
+            # определить sharp/blur по тому, что в результате — пример: если blur_scale>0 для сохранённого набора
+            # Мы не храним флаг отдельно, так что поставим универсальную метку — пользователь увидит разницу в имени
             name = f"{base}_mosaic.png"
             path = os.path.join(desktop, name)
             try:
