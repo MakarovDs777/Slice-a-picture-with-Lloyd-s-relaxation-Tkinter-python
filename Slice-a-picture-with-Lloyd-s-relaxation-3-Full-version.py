@@ -6,15 +6,16 @@ from PIL import Image, ImageTk
 import numpy as np
 import cv2
 
-# Параметры
+# Параметры миниатюр и значения по умолчанию
 THUMB_W, THUMB_H = 140, 100
 DEFAULT_POINTS = 200
 DEFAULT_LLOYD_ITERS = 3
-DEFAULT_BLUR_RADIUS = 6.0  # в пикселях
+DEFAULT_BLUR_RADIUS = 12.0  # по умолчанию достаточно большой, чтобы получить мягкий тон
 
-# ------------------ Вспомогательные функции (Voronoi/Lloyd/отсечение) ------------------
+# ------------------ Вспомогательные функции (Voronoi / Lloyd / обрезка полигона) ------------------
 def subdiv_voronoi_facets(points, rect):
     x0, y0, x1, y1 = rect
+    # Subdiv2D требует int-диапазон в конструкторе: (x,y,w,h) — используем целые
     subdiv = cv2.Subdiv2D((int(x0), int(y0), int(x1 - x0), int(y1 - y0)))
     for p in points:
         subdiv.insert((float(p[0]), float(p[1])))
@@ -108,7 +109,74 @@ def lloyd_relaxation(points, rect, iters):
         pts = np.array(new_pts, dtype=np.float64)
     return pts
 
-# ------------------ Построение мозайки: sharp / blurred ------------------
+# ------------------ Пастер с сильным feather (без чётких границ) ------------------
+def paste_with_strong_feather(out, src_patch, tgt_mask, tx0, ty0, tx1, ty1, feather_radius):
+    """
+    Вставляет src_patch в out в bbox (tx0,ty0,tx1,ty1) с сильным feather:
+    - расширение bbox (pad) чтобы blending выходил за края;
+    - distance transform внутри маски -> alpha;
+    - Gaussian blur по alpha;
+    - небольшое размытие патча (low-pass) чтобы убрать острые детали.
+    feather_radius: радиус (пиксели) — чем больше, тем мягче тон.
+    """
+    h_img, w_img, _ = out.shape
+    tw = tx1 - tx0
+    th = ty1 - ty0
+    if tw <= 0 or th <= 0:
+        return
+
+    # pad — запас вокруг bbox, чтобы плавный переход выходил за границы клетки
+    pad = max(2, int(round(feather_radius * 1.5)))
+    ex_x0 = max(0, tx0 - pad)
+    ex_y0 = max(0, ty0 - pad)
+    ex_x1 = min(w_img, tx1 + pad)
+    ex_y1 = min(h_img, ty1 + pad)
+    ext_w = ex_x1 - ex_x0
+    ext_h = ex_y1 - ex_y0
+
+    if ext_w <= 0 or ext_h <= 0:
+        return
+
+    # ресайзим патч на расширенную область — INTER_LINEAR даёт более мягкое масштабирование
+    resized_ext = cv2.resize(src_patch, (ext_w, ext_h), interpolation=cv2.INTER_LINEAR)
+
+    # маска: ресайз на расширенную область (nearest + бинааризация)
+    mask_ext = cv2.resize(tgt_mask, (ext_w, ext_h), interpolation=cv2.INTER_NEAREST)
+    _, mask_ext = cv2.threshold(mask_ext, 127, 255, cv2.THRESH_BINARY)
+
+    if feather_radius <= 0.5:
+        # простая вставка (без feather)
+        mask_bool = (mask_ext == 255)
+        dst = out[ex_y0:ex_y1, ex_x0:ex_x1]
+        dst[mask_bool] = resized_ext[mask_bool]
+        out[ex_y0:ex_y1, ex_x0:ex_x1] = dst
+        return
+
+    # distance transform внутри маски: расстояние до ближайшего нуля (границы)
+    dist = cv2.distanceTransform(mask_ext, cv2.DIST_L2, 5).astype(np.float32)
+
+    # Нормируем расстояния по feather_radius: внутри центр -> alpha близок к 1, у границы -> 0
+    alpha = np.clip(dist / max(1.0, float(feather_radius)), 0.0, 1.0)
+
+    # Gaussian blur по alpha для ещё более мягкого перехода
+    kr = max(3, int(round(feather_radius)) // 2 * 2 + 1)
+    if kr < 3:
+        kr = 3
+    alpha = cv2.GaussianBlur(alpha, (kr, kr), sigmaX=max(0.1, feather_radius/3.0))
+
+    # Слегка размываем сам патч, чтобы убрать острые углы/детали
+    sigma_patch = max(0.3, feather_radius / 4.0)
+    kpatch = max(3, int(round(sigma_patch)) * 2 + 1)
+    blurred_patch = cv2.GaussianBlur(resized_ext, (kpatch, kpatch), sigmaX=sigma_patch, sigmaY=sigma_patch)
+
+    # Композитим в расширенной зоне
+    alpha_3 = alpha[..., None].astype(np.float32)
+    dst_region = out[ex_y0:ex_y1, ex_x0:ex_x1].astype(np.float32)
+    src_region = blurred_patch.astype(np.float32)
+    composed = dst_region * (1.0 - alpha_3) + src_region * alpha_3
+    out[ex_y0:ex_y1, ex_x0:ex_x1] = np.clip(composed, 0, 255).astype(np.uint8)
+
+# ------------------ Извлечение целевых ячеек (bbox + маска) ------------------
 def extract_target_cells(image, facets, rect):
     h, w, _ = image.shape
     targets = []
@@ -133,16 +201,13 @@ def extract_target_cells(image, facets, rect):
         })
     return targets
 
+# ------------------ Построение мозайки: single / cross source ------------------
 def build_shuffled_mosaic_single_source(image, facets, rect, blur=False, blur_radius=DEFAULT_BLUR_RADIUS):
-    """
-    blur=False -> жёсткая вставка (sharp)
-    blur=True  -> плавная вставка с размытием маски (feather)
-    """
     h, w, _ = image.shape
     targets = extract_target_cells(image, facets, rect)
-    n = len(targets)
-    if n == 0:
+    if len(targets) == 0:
         return image.copy()
+
     # извлекаем патчи-источники из той же картинки
     patches = []
     for t in targets:
@@ -150,7 +215,8 @@ def build_shuffled_mosaic_single_source(image, facets, rect, blur=False, blur_ra
         patch = image[y0:y1, x0:x1].copy()
         mask_bbox = t["mask_bbox"].copy()
         patches.append({"patch": patch, "mask_bbox": mask_bbox, "bbox": (x0,y0,x1,y1)})
-    perm = np.random.permutation(n)
+
+    perm = np.random.permutation(len(targets))
     out = np.zeros_like(image)
 
     for i, tgt in enumerate(targets):
@@ -159,30 +225,25 @@ def build_shuffled_mosaic_single_source(image, facets, rect, blur=False, blur_ra
         tw = tx1 - tx0; th = ty1 - ty0
         if tw <= 0 or th <= 0:
             continue
-        resized = cv2.resize(src["patch"], (tw, th), interpolation=cv2.INTER_NEAREST)
-        tgt_mask = tgt["mask_bbox"]
-        if tgt_mask.shape != (th, tw):
-            tgt_mask = cv2.resize(tgt_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
-            _, tgt_mask = cv2.threshold(tgt_mask, 127, 255, cv2.THRESH_BINARY)
 
         if not blur:
+            # жёсткая вставка: ресайз патча в точный bbox — INTER_NEAREST сохраняет геометрию
+            resized = cv2.resize(src["patch"], (tw, th), interpolation=cv2.INTER_NEAREST)
+            tgt_mask = tgt["mask_bbox"]
+            if tgt_mask.shape != (th, tw):
+                tgt_mask = cv2.resize(tgt_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+                _, tgt_mask = cv2.threshold(tgt_mask, 127, 255, cv2.THRESH_BINARY)
             mask_bool = (tgt_mask == 255)
             dst_region = out[ty0:ty1, tx0:tx1]
             dst_region[mask_bool] = resized[mask_bool]
             out[ty0:ty1, tx0:tx1] = dst_region
         else:
-            # плавное смешивание по размывающейся маске
-            maskf = (tgt_mask.astype(np.float32) / 255.0)
-            # вычисляем ядро: чем больше blur_radius, тем сильнее размытие
-            kr = max(3, int(round(blur_radius))*2 + 1)
-            # если blur_radius очень мал — оставляем минимальное размытие
-            blurred = cv2.GaussianBlur(maskf, (kr, kr), sigmaX=blur_radius, sigmaY=blur_radius)
-            alpha = np.clip(blurred[..., None], 0.0, 1.0)  # (h, w, 1)
-            dst_region = out[ty0:ty1, tx0:tx1].astype(np.float32)
-            resized_f = resized.astype(np.float32)
-            composed = dst_region * (1.0 - alpha) + resized_f * alpha
-            out[ty0:ty1, tx0:tx1] = np.clip(composed, 0, 255).astype(np.uint8)
+            # плавная вставка с сильным feather
+            tgt_mask = tgt["mask_bbox"]
+            # передаём оригинальный src_patch (чтобы paste сделала ресайз на расширенную область)
+            paste_with_strong_feather(out, src["patch"], tgt_mask, tx0, ty0, tx1, ty1, blur_radius)
 
+    # по пустым пикселям (если остались) возвращаем оригинал
     zero_mask = np.all(out == 0, axis=2)
     out[zero_mask] = image[zero_mask]
     return out
@@ -208,26 +269,20 @@ def build_shuffled_mosaic_cross_source(target_image, facets, rect, source_images
         x0 = random.randint(0, sw - crop_w) if sw - crop_w > 0 else 0
         y0 = random.randint(0, sh - crop_h) if sh - crop_h > 0 else 0
         src_patch = src_img[y0:y0+crop_h, x0:x0+crop_w].copy()
-        resized = cv2.resize(src_patch, (tw, th), interpolation=cv2.INTER_NEAREST)
-        tgt_mask = tgt["mask_bbox"]
-        if tgt_mask.shape != (th, tw):
-            tgt_mask = cv2.resize(tgt_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
-            _, tgt_mask = cv2.threshold(tgt_mask, 127, 255, cv2.THRESH_BINARY)
 
         if not blur:
+            resized = cv2.resize(src_patch, (tw, th), interpolation=cv2.INTER_NEAREST)
+            tgt_mask = tgt["mask_bbox"]
+            if tgt_mask.shape != (th, tw):
+                tgt_mask = cv2.resize(tgt_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+                _, tgt_mask = cv2.threshold(tgt_mask, 127, 255, cv2.THRESH_BINARY)
             mask_bool = (tgt_mask == 255)
             dst_region = out[ty0:ty1, tx0:tx1]
             dst_region[mask_bool] = resized[mask_bool]
             out[ty0:ty1, tx0:tx1] = dst_region
         else:
-            maskf = (tgt_mask.astype(np.float32) / 255.0)
-            kr = max(3, int(round(blur_radius))*2 + 1)
-            blurred = cv2.GaussianBlur(maskf, (kr, kr), sigmaX=blur_radius, sigmaY=blur_radius)
-            alpha = np.clip(blurred[..., None], 0.0, 1.0)
-            dst_region = out[ty0:ty1, tx0:tx1].astype(np.float32)
-            resized_f = resized.astype(np.float32)
-            composed = dst_region * (1.0 - alpha) + resized_f * alpha
-            out[ty0:ty1, tx0:tx1] = np.clip(composed, 0, 255).astype(np.uint8)
+            tgt_mask = tgt["mask_bbox"]
+            paste_with_strong_feather(out, src_patch, tgt_mask, tx0, ty0, tx1, ty1, blur_radius)
 
     zero_mask = np.all(out == 0, axis=2)
     out[zero_mask] = target_image[zero_mask]
@@ -237,10 +292,11 @@ def build_shuffled_mosaic_cross_source(target_image, facets, rect, source_images
 class GalleryApp:
     def __init__(self, master):
         self.master = master
-        master.title("Галерея — Мозаика (Sharp / Blur)")
+        master.title("Галерея — Мозаика (Sharp / Strong Blur)")
         self.images = []
         self.selected = set()
         self.result_images = {}
+        self.result_meta = {}  # хранит мета-информацию, например blur flag
 
         # левая панель управления
         ctrl = tk.Frame(master, padx=6, pady=6)
@@ -262,7 +318,7 @@ class GalleryApp:
         tk.Radiobutton(ctrl, text="Cross-source (пулы из выбранных)", variable=self.mode_var, value="cross").pack(anchor="w")
 
         tk.Label(ctrl, text="Feather blur radius (px):").pack(anchor="w", pady=(10,0))
-        self.blur_scale = tk.Scale(ctrl, from_=0, to=40, orient="horizontal", resolution=1)
+        self.blur_scale = tk.Scale(ctrl, from_=0, to=80, orient="horizontal", resolution=1)
         self.blur_scale.set(int(DEFAULT_BLUR_RADIUS))
         self.blur_scale.pack(fill="x", pady=2)
 
@@ -305,12 +361,11 @@ class GalleryApp:
             try:
                 pil = Image.open(p).convert("RGB")
                 arr = np.array(pil)
-                w, h = arr.shape[1], arr.shape[0]
                 thumb = pil.copy()
                 thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
                 thumb_tk = ImageTk.PhotoImage(thumb)
                 idx = len(self.images)
-                self.images.append({"path": p, "arr": arr, "thumb_tk": thumb_tk, "w": w, "h": h})
+                self.images.append({"path": p, "arr": arr, "thumb_tk": thumb_tk, "w": arr.shape[1], "h": arr.shape[0]})
                 self._add_thumb_widget(idx)
             except Exception as e:
                 print("Failed load", p, e)
@@ -398,6 +453,7 @@ class GalleryApp:
         blur_radius = float(self.blur_scale.get()) if blur else 0.0
 
         self.result_images = {}
+        self.result_meta = {}
         for idx in sel_indices:
             img = self.images[idx]["arr"]
             h, w = img.shape[0], img.shape[1]
@@ -414,10 +470,11 @@ class GalleryApp:
                 sources = [self.images[i]["arr"] for i in sel_indices]
                 mosaic = build_shuffled_mosaic_cross_source(img, facets, rect, sources, blur=blur, blur_radius=blur_radius)
             self.result_images[idx] = mosaic
+            self.result_meta[idx] = {"blur": bool(blur), "blur_radius": float(blur_radius)}
 
         first = sel_indices[0]
         self.show_preview(self.result_images[first])
-        st = "With blur" if blur else "No blur"
+        st = f"With blur (r={blur_radius})" if blur else "No blur"
         messagebox.showinfo("Готово", f"Сгенерировано ({st}) для {len(sel_indices)} изображений. Результат показан для первого выбранного.")
 
     def save_all(self):
@@ -425,17 +482,19 @@ class GalleryApp:
             messagebox.showwarning("Внимание", "Нет результатов. Сначала нажмите Generate.")
             return
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        saved = 0
         for idx, arr in self.result_images.items():
             base = os.path.splitext(os.path.basename(self.images[idx]["path"]))[0]
-            # определить sharp/blur по тому, что в результате — пример: если blur_scale>0 для сохранённого набора
-            # Мы не храним флаг отдельно, так что поставим универсальную метку — пользователь увидит разницу в имени
-            name = f"{base}_mosaic.png"
+            meta = self.result_meta.get(idx, {})
+            suffix = "_blur" if meta.get("blur", False) else "_sharp"
+            name = f"{base}{suffix}.png"
             path = os.path.join(desktop, name)
             try:
                 Image.fromarray(arr).save(path)
+                saved += 1
             except Exception as e:
                 print("Save failed", path, e)
-        messagebox.showinfo("Сохранено", f"Сохранены {len(self.result_images)} файлов на рабочий стол.")
+        messagebox.showinfo("Сохранено", f"Сохранены {saved} файлов на рабочий стол.")
 
 # ------------------ main ------------------
 if __name__ == "__main__":
@@ -443,3 +502,4 @@ if __name__ == "__main__":
     app = GalleryApp(root)
     root.geometry("1300x800")
     root.mainloop()
+
